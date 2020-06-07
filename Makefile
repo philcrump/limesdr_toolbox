@@ -1,4 +1,4 @@
-FLAGS = -Wall -lLimeSuite -g -O2
+FLAGS = -Wall -lLimeSuite -g -O3 -march=native -mtune=native
 
 all:
 	gcc -o limesdr_dump limesdr_dump.c limesdr_util.c $(FLAGS)
