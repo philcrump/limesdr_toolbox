@@ -26,7 +26,19 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
 #include "limesdr_util.h"
+
+static uint64_t monotonic_ms(void) {
+    struct timespec tp;
+
+    if(clock_gettime(CLOCK_MONOTONIC, &tp) != 0)
+    {
+        return 0;
+    }
+
+    return (uint64_t) tp.tv_sec * 1000 + tp.tv_nsec / 1000000;
+}
 
 // Global variable used by the signal handler and capture/encoding loop
 static int want_quit = 0;
@@ -52,6 +64,7 @@ int main(int argc, char** argv)
 		       "  -a <ANTENNA> (BAND1 | BAND2) (default: BAND1)\n"
 			   "  -r <RRC FILTER> (0 | 2 | 4) (default: 0)\n"
 		       "  -i <INPUT_FILENAME> (default: stdin)\n"
+			   "  -L <loop_fileEnable> (default: 0)\n"
 			   "  -q <CalibrationEnable> (default: 1)\n");
 		return 1;
 	}
@@ -67,6 +80,8 @@ int main(int argc, char** argv)
 	int rrc=1;
 	char* antenna = "BAND1";
 	char* input_filename = NULL;
+	bool loop_file = false;
+	size_t file_size = 0;
 	bool WithCalibration=false; // Not backward compatible but prevent spike on big PA
 	for ( i = 1; i < argc-1; i += 2 ) {
 		if      (strcmp(argv[i], "-f") == 0) { freq = atof( argv[i+1] ); }
@@ -81,6 +96,7 @@ int main(int argc, char** argv)
 		else if (strcmp(argv[i], "-r") == 0) { rrc = atoi( argv[i+1] ); }
 		else if (strcmp(argv[i], "-i") == 0) { input_filename = argv[i+1]; }
 		else if (strcmp(argv[i], "-q") == 0) { WithCalibration = atoi(argv[i+1]); }
+		else if (strcmp(argv[i], "-L") == 0) { loop_file = atoi(argv[i+1]); }
 	}
 	if ( freq == 0 ) {
 		fprintf( stderr, "ERROR: invalid frequency : %d\n", freq );
@@ -102,6 +118,9 @@ int main(int argc, char** argv)
 			perror("");
 			return 1;
 		}
+		fseek(fd, 0L, SEEK_END);
+		file_size = ftell(fd);
+		rewind(fd);
 	}
     bool isapipe = (fseek(fd, 0, SEEK_CUR) < 0); //Dirty trick to see if it is a pipe or not
 	if (isapipe)
@@ -176,42 +195,37 @@ int main(int argc, char** argv)
 	bool FirstTx=true;
 	bool Transition=true;
 	int TotalSampleSent=0;
-	int DebugCount=0;
-	while( !want_quit ) {
-		
-			lms_stream_status_t Status;
-			LMS_GetStreamStatus(&tx_stream,&Status);
+	uint64_t last_debug_monotonic = 0;
+	while( !want_quit )
+	{
+		lms_stream_status_t Status;
+		LMS_GetStreamStatus(&tx_stream,&Status);
 
-		if(DebugCount%100==0)
+		if(monotonic_ms() > (last_debug_monotonic + 500))
 		{
-			fprintf(stderr,"Fifo =%d/%d\n",Status.fifoFilledCount,Status.fifoSize);
-			/*
-			if(Status.fifoFilledCount<Status.fifoSize*0.2)
+			fprintf(stderr,"Fifo = %d/%d\n",Status.fifoFilledCount,Status.fifoSize);
+			if(!isapipe)
 			{
-					fprintf(stderr,"Fifo nearly empty=%d/%d\n",Status.fifoFilledCount,Status.fifoSize);
-					//memset(buff,0,buffer_size*sizeof(*buff));
-					//LMS_SendStream( &tx_stream, buff, (Status.fifoSize-Status.fifoFilledCount)/sizeof( *buff ), NULL, 1000 );
-			}*/
-		}		
-		DebugCount++;	
+				fprintf(stderr,"File progress: %.1f%% (%d/%d samples)\n",
+					100 * ((float)(TotalSampleSent-Status.fifoFilledCount) / (file_size/sizeof(struct s16iq_sample_s))),
+					TotalSampleSent-Status.fifoFilledCount,
+					(file_size/sizeof(struct s16iq_sample_s))
+				);
+			}
+			last_debug_monotonic = monotonic_ms();
+		}	
 		int nb_samples_to_send = fread( buff, sizeof( *buff ), buffer_size, fd );
 
-		if((!FirstTx)&&(Status.fifoFilledCount<Status.fifoSize*0.25))
+		if(FirstTx && (Status.fifoFilledCount > (0.5 * Status.fifoSize)))
 		{
-			memset(buff,0,buffer_size*sizeof(struct s16iq_sample_s));
-			for(int i=0;i<8;i++)
-				LMS_SendStream( &tx_stream, buff, buffer_size, NULL/*&tx_meta*/, 1000 );
-			fprintf(stderr,"Underflow ! %d\n",Status.fifoFilledCount);
-			
-		}
-		if(FirstTx&&(Status.fifoFilledCount==Status.fifoSize))
-		{
-			fprintf(stderr,"Restart stream %d \n",Status.fifoFilledCount);
+			fprintf(stderr,"Fifo 50%% (%d/%d), starting stream.\n",Status.fifoFilledCount,Status.fifoSize);
 			LMS_StartStream(&tx_stream);
 			FirstTx=false;
 		}
-		if ( nb_samples_to_send == 0 ) { // no more samples to send, quit if pipe, loop if a file
-            if(!isapipe)
+		if ( nb_samples_to_send == 0 && Status.fifoFilledCount == 0)
+		{
+			// no more samples to send and fifo empty, quit if pipe, loop if a file
+            if(!isapipe && loop_file)
             {
                  fseek(fd, 0, SEEK_SET);
                  continue;
@@ -220,10 +234,11 @@ int main(int argc, char** argv)
 			    break;
 		}
 		int nb_samples;
+
 		if(!FirstTx)
-	    	 nb_samples = LMS_SendStream( &tx_stream, buff, nb_samples_to_send, NULL/*&tx_meta*/, 1000 );
+			nb_samples = LMS_SendStream( &tx_stream, buff, nb_samples_to_send, NULL/*&tx_meta*/, 1000 );
 		else
-				 nb_samples = LMS_SendStream( &tx_stream, buff, nb_samples_to_send, NULL/*&tx_meta*/, 000 );
+			nb_samples = LMS_SendStream( &tx_stream, buff, nb_samples_to_send, NULL/*&tx_meta*/, 000 );
 		TotalSampleSent+=nb_samples;
 		if ( nb_samples < 0 ) {
 			fprintf(stderr, "LMS_SendStream() : %s\n", LMS_GetLastErrorMessage());
@@ -239,6 +254,8 @@ int main(int argc, char** argv)
 		}
 		tx_meta.timestamp += nb_samples;
 	}
+	fprintf(stderr, "Exiting..\n");
+
 	LMS_SetNormalizedGain( device, LMS_CH_TX, channel, 0 );
 	LMS_StopStream(&tx_stream);
 	LMS_DestroyStream(device, &tx_stream);
