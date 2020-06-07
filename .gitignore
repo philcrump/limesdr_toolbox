@@ -1,0 +1,6 @@
+*~
+*.swp
+limesdr_dump
+limesdr_forward
+limesdr_send
+limesdr_stopchannel
